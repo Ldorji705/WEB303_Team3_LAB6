@@ -1,0 +1,14 @@
+{
+  "name": "order-service",
+  "version": "1.0.0",
+  "private": true,
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --env-file=../../.env --watch index.js"
+  },
+  "dependencies": {
+    "@cafe/shared": "*",
+    "express": "^4.19.2"
+  }
+}
