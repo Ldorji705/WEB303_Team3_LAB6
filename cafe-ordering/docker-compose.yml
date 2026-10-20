@@ -1,0 +1,34 @@
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: cafe-postgres
+    environment:
+      POSTGRES_USER: cafe
+      POSTGRES_PASSWORD: cafe_dev_password
+      POSTGRES_DB: orders_db
+    ports:
+      - "5435:5432"
+    volumes:
+      - cafe_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cafe -d orders_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: cafe-rabbitmq
+    ports:
+      - "5673:5672"
+      - "15673:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  cafe_postgres_data:
+
