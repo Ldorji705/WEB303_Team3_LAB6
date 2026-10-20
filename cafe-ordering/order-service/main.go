@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"cafe/shared/broker"
@@ -141,14 +142,26 @@ func (s *Service) createOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Use card when the client does not specify a payment method.
+	// Normalize the payment method received from the UI.
+	request.PaymentMethod = strings.ToLower(
+		strings.TrimSpace(request.PaymentMethod),
+	)
+
+	// Use card when no payment method is supplied.
 	if request.PaymentMethod == "" {
 		request.PaymentMethod = "card"
 	}
 
-	// These methods support successful and declined-payment testing.
-	if request.PaymentMethod != "card" &&
-		request.PaymentMethod != "declined_card" {
+	// Accept the payment methods offered by the UI.
+	allowedMethods := map[string]bool{
+		"cash":          true,
+		"mbob":          true,
+		"bips":          true,
+		"card":          true,
+		"declined_card": true,
+	}
+
+	if !allowedMethods[request.PaymentMethod] {
 		httpx.Error(w, http.StatusBadRequest, "Unsupported payment method")
 		return
 	}
@@ -157,6 +170,7 @@ func (s *Service) createOrder(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "Order must contain at least one item")
 		return
 	}
+
 	if len(request.Items) > 50 {
 		httpx.Error(w, http.StatusBadRequest, "Too many items in one order")
 		return
@@ -195,6 +209,7 @@ func (s *Service) createOrder(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusBadRequest, "Unknown menu item: "+requested.MenuItemID)
 			return
 		}
+
 		if err != nil {
 			httpx.Error(w, http.StatusInternalServerError, "Could not look up menu item")
 			return
@@ -206,6 +221,7 @@ func (s *Service) createOrder(w http.ResponseWriter, r *http.Request) {
 			Quantity:   requested.Quantity,
 			UnitPrice:  item.Price,
 		})
+
 		order.Total += item.Price * float64(requested.Quantity)
 	}
 
@@ -233,7 +249,7 @@ func (s *Service) createOrder(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Include the payment method in the event consumed by Payment Service.
+	// Include the normalized payment method in the order event.
 	event, err := events.New(events.OrderPlaced, "order-service", map[string]any{
 		"order_id":       order.ID,
 		"items":          order.Items,
@@ -252,7 +268,6 @@ func (s *Service) createOrder(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Save the event in the same transaction as the order.
-	// The background publisher sends it to RabbitMQ.
 	_, err = tx.ExecContext(
 		ctx,
 		`INSERT INTO outbox_events (id, event_type, source, payload)
@@ -288,6 +303,7 @@ func (s *Service) listOrders(w http.ResponseWriter, r *http.Request) {
 
 	for rows.Next() {
 		var order Order
+
 		if err := rows.Scan(
 			&order.ID, &order.Total, &order.Status, &order.CreatedAt,
 		); err != nil {
@@ -321,6 +337,7 @@ func (s *Service) getOrder(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var order Order
+
 	err := s.db.QueryRowContext(
 		r.Context(),
 		`SELECT id, total, status, created_at
@@ -332,6 +349,7 @@ func (s *Service) getOrder(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusNotFound, "Order not found")
 		return
 	}
+
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, "Could not load order")
 		return
@@ -373,11 +391,13 @@ func (s *Service) loadOrderItems(
 
 	for rows.Next() {
 		var item OrderItem
+
 		if err := rows.Scan(
 			&item.MenuItemID, &item.Name, &item.Quantity, &item.UnitPrice,
 		); err != nil {
 			return nil, err
 		}
+
 		items = append(items, item)
 	}
 
@@ -441,11 +461,13 @@ func (s *Service) publishPending(
 
 	for rows.Next() {
 		var event pendingEvent
+
 		if err := rows.Scan(&event.ID, &event.Type, &event.Payload); err != nil {
 			rows.Close()
 			log.Printf("Read outbox row: %v", err)
 			return
 		}
+
 		pending = append(pending, event)
 	}
 
