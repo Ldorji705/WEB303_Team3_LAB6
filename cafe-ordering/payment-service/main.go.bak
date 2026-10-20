@@ -1,0 +1,343 @@
+package main
+
+import (
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"time"
+
+	"github.com/google/uuid"
+	amqp "github.com/rabbitmq/amqp091-go"
+
+	"cafe/shared/broker"
+	"cafe/shared/events"
+	"cafe/shared/httpx"
+	"cafe/shared/store"
+)
+
+const (
+	serviceName = "payment-service"
+	queueName   = "payment-service.queue"
+)
+
+type OrderPlacedData struct {
+	OrderID       string  `json:"order_id"`
+	Total         float64 `json:"total"`
+	PaymentMethod string  `json:"payment_method"`
+}
+
+type PaymentResult struct {
+	OrderID   string  `json:"order_id"`
+	PaymentID string  `json:"payment_id"`
+	Amount    float64 `json:"amount"`
+	Status    string  `json:"status"`
+	Reason    string  `json:"reason,omitempty"`
+}
+
+var db *sql.DB
+
+func main() {
+	databaseURL := os.Getenv("PAYMENTS_DATABASE_URL")
+	if databaseURL == "" {
+		databaseURL = os.Getenv("DATABASE_URL")
+	}
+	if databaseURL == "" {
+		databaseURL = "postgres://cafe:cafe_dev_password@localhost:5435/payments_db?sslmode=disable"
+	}
+
+	var err error
+	db, err = store.Open(databaseURL)
+	if err != nil {
+		log.Fatalf("Cannot connect to payments database: %v", err)
+	}
+	defer db.Close()
+
+	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		if err := db.Ping(); err != nil {
+			httpx.JSON(w, http.StatusServiceUnavailable, map[string]string{
+				"service": serviceName,
+				"status":  "database unavailable",
+			})
+			return
+		}
+
+		httpx.JSON(w, http.StatusOK, map[string]string{
+			"service": serviceName,
+			"status":  "ok",
+		})
+	})
+
+	http.HandleFunc("/payments", listPayments)
+
+	go consumeOrders()
+
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8082"
+	}
+
+	log.Printf("Payment Service listening on http://localhost:%s", port)
+	log.Fatal(http.ListenAndServe(":"+port, nil))
+}
+
+func listPayments(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	rows, err := db.Query(`
+		SELECT id, order_id, amount, payment_method, status, reason, created_at
+		FROM payments
+		ORDER BY created_at DESC
+	`)
+	if err != nil {
+		http.Error(w, "Could not retrieve payments", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	type paymentRecord struct {
+		ID            string    `json:"id"`
+		OrderID       string    `json:"order_id"`
+		Amount        float64   `json:"amount"`
+		PaymentMethod string    `json:"payment_method"`
+		Status        string    `json:"status"`
+		Reason        string    `json:"reason,omitempty"`
+		CreatedAt     time.Time `json:"created_at"`
+	}
+
+	records := []paymentRecord{}
+	for rows.Next() {
+		var p paymentRecord
+		var reason sql.NullString
+		if err := rows.Scan(
+			&p.ID, &p.OrderID, &p.Amount, &p.PaymentMethod,
+			&p.Status, &reason, &p.CreatedAt,
+		); err != nil {
+			http.Error(w, "Could not read payment records", http.StatusInternalServerError)
+			return
+		}
+		if reason.Valid {
+			p.Reason = reason.String
+		}
+		records = append(records, p)
+	}
+
+	if err := rows.Err(); err != nil {
+		http.Error(w, "Could not read payment records", http.StatusInternalServerError)
+		return
+	}
+
+	httpx.JSON(w, http.StatusOK, records)
+}
+
+func consumeOrders() {
+	for {
+		if err := consume(); err != nil {
+			log.Printf("Payment consumer stopped: %v. Retrying in 5 seconds...", err)
+			time.Sleep(5 * time.Second)
+		}
+	}
+}
+
+func consume() error {
+	conn, ch, err := broker.Connect()
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	defer ch.Close()
+
+	_, err = ch.QueueDeclare(queueName, true, false, false, false, nil)
+	if err != nil {
+		return err
+	}
+
+	err = ch.QueueBind(queueName, events.OrderPlaced, broker.ExchangeName, false, nil)
+	if err != nil {
+		return err
+	}
+
+	if err = ch.Qos(1, 0, false); err != nil {
+		return err
+	}
+
+	messages, err := ch.Consume(queueName, "", false, false, false, false, nil)
+	if err != nil {
+		return err
+	}
+
+	log.Println("Waiting for order.placed events...")
+
+	for msg := range messages {
+		if err := processOrder(ch, msg); err != nil {
+			log.Printf("Failed to process message: %v", err)
+			if nackErr := msg.Nack(false, true); nackErr != nil {
+				return nackErr
+			}
+			continue
+		}
+
+		if err := msg.Ack(false); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func processOrder(ch *amqp.Channel, msg amqp.Delivery) error {
+	var envelope events.Envelope
+	if err := json.Unmarshal(msg.Body, &envelope); err != nil {
+		return err
+	}
+	if envelope.Type != events.OrderPlaced {
+		return fmt.Errorf("unexpected event type: %s", envelope.Type)
+	}
+
+	var order OrderPlacedData
+	if err := json.Unmarshal(envelope.Data, &order); err != nil {
+		return err
+	}
+
+	if order.OrderID == "" {
+		return errors.New("order.placed event has no order_id")
+	}
+
+	orderUUID, err := uuid.Parse(order.OrderID)
+	if err != nil {
+		return fmt.Errorf("invalid order ID %q: %w", order.OrderID, err)
+	}
+
+	method := order.PaymentMethod
+	if method == "" {
+		method = "card"
+	}
+
+	result := PaymentResult{
+		OrderID: order.OrderID,
+		Amount:  order.Total,
+	}
+
+	switch {
+	case method == "declined_card":
+		result.Status = "FAILED"
+		result.Reason = "Card was declined"
+	case order.Total > 5000:
+		result.Status = "FAILED"
+		result.Reason = "Order total exceeds Nu. 5000"
+	default:
+		result.Status = "COMPLETED"
+	}
+
+	result.PaymentID = uuid.NewString()
+
+	eventType := events.PaymentCompleted
+	if result.Status == "FAILED" {
+		eventType = events.PaymentFailed
+	}
+
+	outgoing, err := events.New(eventType, serviceName, result)
+	if err != nil {
+		return err
+	}
+
+	body, err := json.Marshal(outgoing)
+	if err != nil {
+		return err
+	}
+
+	// Persist the payment and its outgoing event atomically.
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// If the order was already processed, do not create another payment.
+	var existingStatus string
+	err = tx.QueryRow(
+		`SELECT status FROM payments WHERE order_id = $1`,
+		orderUUID,
+	).Scan(&existingStatus)
+
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+
+	_, err = tx.Exec(`
+		INSERT INTO payments
+			(id, order_id, amount, payment_method, status, reason)
+		VALUES ($1, $2, $3, $4, $5, NULLIF($6, ''))
+		ON CONFLICT (order_id) DO NOTHING
+	`, result.PaymentID, orderUUID, result.Amount, method, result.Status, result.Reason)
+	if err != nil {
+		return err
+	}
+
+	// Only insert the event if this transaction inserted the payment.
+	var insertedID string
+	err = tx.QueryRow(`
+		SELECT id FROM payments WHERE order_id = $1
+	`, orderUUID).Scan(&insertedID)
+	if err != nil {
+		return err
+	}
+
+	if insertedID != result.PaymentID {
+		return nil
+	}
+
+	_, err = tx.Exec(`
+		INSERT INTO outbox_events (id, event_type, source, payload)
+		VALUES ($1, $2, $3, $4::jsonb)
+	`, outgoing.ID, eventType, serviceName, string(body))
+	if err != nil {
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+
+	// Publish after committing. A future outbox relay should retry unpublished
+	// rows after crashes; this direct publish keeps the current project flow
+	// working while storing the event durably.
+	if err := ch.Publish(
+		broker.ExchangeName,
+		eventType,
+		false,
+		false,
+		amqp.Publishing{
+			ContentType:  "application/json",
+			DeliveryMode: amqp.Persistent,
+			Timestamp:    time.Now().UTC(),
+			Body:         body,
+		},
+	); err != nil {
+		return fmt.Errorf("payment saved but event publish failed; outbox relay needed: %w", err)
+	}
+
+	_, err = db.Exec(`
+		UPDATE outbox_events
+		SET published_at = NOW()
+		WHERE id = $1 AND published_at IS NULL
+	`, outgoing.ID)
+	if err != nil {
+		return err
+	}
+
+	log.Printf(
+		"Processed order %s: payment %s (Nu. %.2f)",
+		order.OrderID, result.Status, order.Total,
+	)
+	return nil
+}
